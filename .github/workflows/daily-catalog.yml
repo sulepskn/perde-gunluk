@@ -11,16 +11,17 @@ concurrency:
 jobs:
   refresh:
     if: github.event.repository.private == false
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 180
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.1.0
         with:
           python-version: '3.12'
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7.1.0
         with:
-          node-version: '22'
+          node-version: '24'
+          package-manager-cache: false
       - name: Install pinned Cloudflare deploy tool
         run: npm install --global wrangler@4.92.0
       - name: Check deployment credentials before downloading data
@@ -47,6 +48,7 @@ jobs:
       - name: Check data and application regressions
         working-directory: work/source/perde-daily
         run: |
+          node scripts/daily_client.mjs
           node --test tests/*.test.mjs
           python -m unittest discover -s tests -p 'test_daily_*.py'
       - name: Build full title catalogue and IMDb snapshots
