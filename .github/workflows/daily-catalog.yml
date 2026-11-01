@@ -1,0 +1,91 @@
+name: Perde daily catalogue IMDb and Turkey platforms
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 9 * * *'
+permissions:
+  contents: write
+concurrency:
+  group: perde-daily-public-data
+  cancel-in-progress: false
+jobs:
+  refresh:
+    if: github.event.repository.private == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install pinned Cloudflare deploy tool
+        run: npm install --global wrangler@4.92.0
+      - name: Check deployment credentials before downloading data
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
+        run: |
+          python - <<'PY'
+          import os,json,urllib.request
+          for name in ['CLOUDFLARE_API_TOKEN','CLOUDFLARE_ACCOUNT_ID','TMDB_API_KEY']:
+              if not os.getenv(name):raise SystemExit('Required secret missing: '+name)
+          request=urllib.request.Request('https://api.cloudflare.com/client/v4/user/tokens/verify',headers={'Authorization':'Bearer '+os.environ['CLOUDFLARE_API_TOKEN']})
+          with urllib.request.urlopen(request,timeout=30) as response:result=json.load(response)
+          if not result.get('success') or result.get('result',{}).get('status')!='active':raise SystemExit('Cloudflare token is not active')
+          print('Required credentials present; Cloudflare token active.')
+          PY
+      - name: Prepare reviewed source and optional initial public-data checkpoint
+        run: |
+          python -m zipfile -e perde-source.zip work/source
+          mkdir -p work/source/perde-daily/status work/source/perde-daily/work
+          if [ -f status/latest-public-snapshot.json ]; then cp status/latest-public-snapshot.json work/source/perde-daily/status/; fi
+          if [ -f platform-bootstrap.jsonl.gz ]; then gzip -dc platform-bootstrap.jsonl.gz > work/source/perde-daily/work/platform-resume.jsonl; fi
+      - name: Check data and application regressions
+        working-directory: work/source/perde-daily
+        run: |
+          node --test tests/*.test.mjs
+          python -m unittest discover -s tests -p 'test_daily_*.py'
+      - name: Build full title catalogue and IMDb snapshots
+        working-directory: work/source/perde-daily
+        run: python scripts/daily_catalog.py --output work/daily-generated
+      - name: Check Turkey platform availability and new titles
+        working-directory: work/source/perde-daily
+        env:
+          TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
+        run: python scripts/daily_platforms.py --output work/daily-generated/platform-snapshots --catalogue work/daily-generated/catalogue --base-url https://perde-bagimsiz.sulepiskin.workers.dev
+      - name: Publish only complete validated public snapshots
+        working-directory: work/source/perde-daily
+        run: |
+          python - <<'PY'
+          import pathlib,shutil,json
+          root=pathlib.Path('work/daily-generated')
+          platforms=json.loads((root/'platform-snapshots/manifest.json').read_text())
+          if platforms['count']<10000:raise SystemExit('Platform snapshot incomplete')
+          status=json.loads((root/'daily-status.json').read_text())
+          status['platforms']={k:platforms[k] for k in ['snapshot','count','currently_available','changes']}
+          status['built_at']=platforms['built_at']
+          (root/'daily-status.json').write_text(json.dumps(status),encoding='utf-8')
+          for name in ['catalogue','imdb','platform-snapshots']:
+              shutil.copytree(root/name,pathlib.Path('public')/name,dirs_exist_ok=True)
+          shutil.copyfile(root/'daily-status.json','public/daily-status.json')
+          PY
+      - name: Deploy existing Perde without modifying personal archive
+        working-directory: work/source/perde-daily
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          WRANGLER_SEND_METRICS: 'false'
+        run: wrangler deploy --config wrangler.jsonc
+      - name: Record actual deployed source dates
+        run: |
+          mkdir -p status
+          cp work/source/perde-daily/public/daily-status.json status/latest-public-snapshot.json
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add status/latest-public-snapshot.json
+          git diff --cached --quiet || git commit -m "Record deployed Perde public data snapshots"
+          git push
